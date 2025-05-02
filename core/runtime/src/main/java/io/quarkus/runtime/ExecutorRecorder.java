@@ -1,12 +1,21 @@
 package io.quarkus.runtime;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.IntSupplier;
 
 import org.jboss.logging.Logger;
@@ -16,6 +25,8 @@ import org.jboss.threads.JBossExecutors;
 import org.jboss.threads.JBossThreadFactory;
 
 import io.quarkus.runtime.annotations.Recorder;
+import io.quarkus.runtime.metrics.MetricsFactory;
+import io.quarkus.runtime.metrics.MetricsFactory.TimeRecorder;
 import io.quarkus.runtime.util.NoopShutdownScheduledExecutorService;
 import io.smallrye.common.cpu.ProcessorInfo;
 
@@ -36,7 +47,8 @@ public class ExecutorRecorder {
     }
 
     public ScheduledExecutorService setupRunTime(ShutdownContext shutdownContext,
-            LaunchMode launchMode, ThreadFactory threadFactory, ContextHandler<Object> contextHandler) {
+            LaunchMode launchMode, ThreadFactory threadFactory, ContextHandler<Object> contextHandler,
+            MetricsExecutor metricsExecutor) {
         final EnhancedQueueExecutor underlying = createExecutor(threadPoolConfig, threadFactory, contextHandler);
         if (launchMode == LaunchMode.DEVELOPMENT) {
             shutdownContext.addLastShutdownTask(new Runnable() {
@@ -68,6 +80,10 @@ public class ExecutorRecorder {
         // As a result the quarkus.thread-pool.shutdown-interrupt config property and logic defined in ExecutorRecorder.createShutdownTask() is completely ignored
         if (launchMode != LaunchMode.DEVELOPMENT) {
             managed = new NoopShutdownScheduledExecutorService(underlying);
+        }
+        if (metricsExecutor != null) {
+            metricsExecutor.setDelegate(managed);
+            managed = metricsExecutor;
         }
         current = managed;
         return managed;
@@ -218,5 +234,188 @@ public class ExecutorRecorder {
 
     public static Executor getCurrent() {
         return current;
+    }
+
+    public MetricsExecutor createMetricsDelegate() {
+        return new MetricsExecutor();
+    }
+
+    public static class MetricsExecutor implements ScheduledExecutorService, Consumer<MetricsFactory> {
+        private TimeRecorder usage;
+        private final AtomicInteger active = new AtomicInteger();
+        private final AtomicInteger total = new AtomicInteger();
+        private final AtomicInteger rejected = new AtomicInteger();
+        private ScheduledExecutorService delegate;
+
+        private MetricsExecutor() {
+        }
+
+        @Override
+        public void accept(MetricsFactory metricsFactory) {
+            metricsFactory.builder("worker_pool_rejected_total", MetricsFactory.Type.BASE).tag("pool_name", "quarkus_worker")
+                    .buildCounter(rejected::get);
+            metricsFactory.builder("worker_pool_completed_total", MetricsFactory.Type.BASE).tag("pool_name", "quarkus_worker")
+                    .buildCounter(total::get);
+            this.usage = metricsFactory.builder("worker_pool_usage_seconds", MetricsFactory.Type.BASE)
+                    .tag("pool_name", "quarkus_worker").buildTimer();
+            metricsFactory.builder("worker_pool_active", MetricsFactory.Type.BASE).tag("pool_name", "quarkus_worker")
+                    .buildGauge(active::get);
+        }
+
+        private void setDelegate(ScheduledExecutorService delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void execute(Runnable arg0) {
+            delegate.execute(new MetricsExecutorTask(arg0));
+        }
+
+        @Override
+        public <V> ScheduledFuture<V> schedule(Callable<V> callable, long delay, TimeUnit unit) {
+            return delegate.schedule(new MetricsExecutorCallable<>(callable), delay, unit);
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
+            return delegate.schedule(new MetricsExecutorTask(command), delay, unit);
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(Runnable command, long initialDelay, long period, TimeUnit unit) {
+            return delegate.scheduleAtFixedRate(new MetricsExecutorTask(command), initialDelay, period, unit);
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(Runnable command, long initialDelay, long delay,
+                TimeUnit unit) {
+            return delegate.scheduleWithFixedDelay(new MetricsExecutorTask(command), initialDelay, delay, unit);
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+            return delegate.awaitTermination(timeout, unit);
+        }
+
+        @Override
+        public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks) throws InterruptedException {
+            final List<Callable<T>> items = new ArrayList<>(tasks.size());
+            for (var task : tasks) {
+                items.add(new MetricsExecutorCallable<>(task));
+            }
+            return delegate.invokeAll(items);
+        }
+
+        @Override
+        public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit)
+                throws InterruptedException {
+            final List<Callable<T>> items = new ArrayList<>(tasks.size());
+            for (var task : tasks) {
+                items.add(new MetricsExecutorCallable<>(task));
+            }
+            return delegate.invokeAll(items, timeout, unit);
+        }
+
+        @Override
+        public <T> T invokeAny(Collection<? extends Callable<T>> tasks)
+                throws InterruptedException, ExecutionException {
+            final List<Callable<T>> items = new ArrayList<>(tasks.size());
+            for (var task : tasks) {
+                items.add(new MetricsExecutorCallable<>(task));
+            }
+            return delegate.invokeAny(items);
+        }
+
+        @Override
+        public <T> T invokeAny(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit)
+                throws InterruptedException, ExecutionException, TimeoutException {
+            final List<Callable<T>> items = new ArrayList<>(tasks.size());
+            for (var task : tasks) {
+                items.add(new MetricsExecutorCallable<>(task));
+            }
+            return delegate.invokeAny(items, timeout, unit);
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return delegate.isShutdown();
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return delegate.isTerminated();
+        }
+
+        @Override
+        public void shutdown() {
+            delegate.shutdown();
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            return delegate.shutdownNow();
+        }
+
+        @Override
+        public Future<?> submit(Runnable task) {
+            return delegate.submit(new MetricsExecutorTask(task));
+        }
+
+        @Override
+        public <T> Future<T> submit(Callable<T> task) {
+            return delegate.submit(new MetricsExecutorCallable<>(task));
+        }
+
+        @Override
+        public <T> Future<T> submit(Runnable task, T result) {
+            return delegate.submit(new MetricsExecutorTask(task), result);
+        }
+
+        private class MetricsExecutorTask implements Runnable {
+
+            private final Runnable wrapped;
+
+            private MetricsExecutorTask(Runnable r) {
+                this.wrapped = r;
+            }
+
+            @Override
+            public void run() {
+                if (rejected == null) {
+                    wrapped.run();
+                    return;
+                }
+                active.incrementAndGet();
+                long now = System.currentTimeMillis();
+                wrapped.run();
+                usage.update(System.currentTimeMillis() - now, TimeUnit.MILLISECONDS);
+                active.decrementAndGet();
+                total.incrementAndGet();
+            }
+        }
+
+        private class MetricsExecutorCallable<V> implements Callable<V> {
+
+            private final Callable<V> wrapped;
+
+            private MetricsExecutorCallable(Callable<V> r) {
+                this.wrapped = r;
+            }
+
+            @Override
+            public V call() throws Exception {
+                if (rejected == null) {
+                    return wrapped.call();
+                }
+                active.incrementAndGet();
+                final long now = System.currentTimeMillis();
+                final V result = wrapped.call();
+                usage.update(System.currentTimeMillis() - now, TimeUnit.MILLISECONDS);
+                active.decrementAndGet();
+                total.incrementAndGet();
+                return result;
+            }
+
+        }
     }
 }
